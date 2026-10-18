@@ -1,9 +1,14 @@
 package srun
 
+import (
+	"encoding/json"
+	"errors"
+)
+
 type LoginForm struct {
 	Domain   string `json:"domain" yaml:"domain"`
 	Username string `json:"username" yaml:"username"`
-	//运营商类型
+	// CUG 的 isp 参数；当前账号登录页留空，不追加到用户名。
 	UserType string `json:"user_type" yaml:"user_type"`
 	Password string `json:"password" yaml:"password"`
 }
@@ -34,7 +39,7 @@ func (o LoginFormOverride) Apply(form LoginForm) LoginForm {
 type LoginMeta struct {
 	N           string `json:"n" yaml:"n"`
 	Type        string `json:"type" yaml:"type"`
-	Acid        string `json:"acid" yaml:"acid"`
+	Acid        string `json:"acid" yaml:"acid"` // CUG nasId
 	Enc         string `json:"enc" yaml:"enc"`
 	OS          string `json:"os" yaml:"os"`
 	Name        string `json:"name" yaml:"name"`
@@ -45,4 +50,32 @@ type LoginMeta struct {
 type LoginInfo struct {
 	Form LoginForm
 	Meta LoginMeta
+}
+
+// CUG 的 isChangePwd 可能返回 JSON 字符串或数字。
+type changePasswordFlag int
+
+func (flag *changePasswordFlag) UnmarshalJSON(data []byte) error {
+	var value json.Number
+	if err := json.Unmarshal(data, &value); err == nil {
+		switch value.String() {
+		case "0":
+			*flag = 0
+			return nil
+		case "1":
+			*flag = 1
+			return nil
+		}
+	}
+	return errors.New("isChangePwd: expected 0 or 1 as a number or string")
+}
+
+type accountResponse struct {
+	Code        *int               `json:"code"`
+	Msg         string             `json:"msg"`
+	AuthCode    string             `json:"authCode"`
+	IsChangePwd changePasswordFlag `json:"isChangePwd"`
+	Online      *struct {
+		UserIpv4 string `json:"UserIpv4"`
+	} `json:"online"`
 }

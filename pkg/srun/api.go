@@ -4,24 +4,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
 	"net/http"
+	"net/http/cookiejar"
+	"net/url"
 	"strings"
 	"time"
 
-	"github.com/Mmx233/tool"
 	log "github.com/sirupsen/logrus"
 )
 
-type Api struct {
-	BaseUrl string
+type apiSession struct {
+	params    url.Values
+	csrfToken string
+}
 
-	Client *http.Client
-	// 禁用自动重定向
+type Api struct {
+	BaseUrl      string
+	Client       *http.Client
 	NoDirect     *http.Client
 	CustomHeader map[string]interface{}
-
-	Logger log.FieldLogger
+	Logger       log.FieldLogger
+	*apiSession
 }
 
 type ApiConfig struct {
@@ -33,26 +36,30 @@ type ApiConfig struct {
 }
 
 func (a *Api) Init(conf *ApiConfig) {
-	a.BaseUrl = "http"
+	scheme := "http"
 	if conf.Https {
-		a.BaseUrl += "s"
+		scheme = "https"
 	}
-	a.BaseUrl = a.BaseUrl + "://" + conf.Domain + "/"
-
+	a.BaseUrl = scheme + "://" + conf.Domain + "/"
 	a.CustomHeader = conf.CustomHeader
+	a.apiSession = &apiSession{}
 
-	// 初始化 http client
-	a.Client = conf.Client
-	copyClient := *conf.Client
-	a.NoDirect = &copyClient
-	a.NoDirect.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+	client := http.Client{Timeout: 10 * time.Second}
+	if conf.Client != nil {
+		client = *conf.Client
+	}
+	// 每个认证会话独立保存 Cookie，继续使用调用方绑定网卡的 Transport。
+	client.Jar, _ = cookiejar.New(nil)
+	// API 请求不跟随跳转，防止携带凭据的 POST 被转发到其他地址。
+	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
 		return http.ErrUseLastResponse
 	}
-
-	if conf.Logger == nil {
-		conf.Logger = log.New()
-	}
+	a.Client = &client
+	a.NoDirect = &client
 	a.Logger = conf.Logger
+	if a.Logger == nil {
+		a.Logger = log.New()
+	}
 }
 
 func (a *Api) WithLogger(logger log.FieldLogger) *Api {
@@ -61,89 +68,96 @@ func (a *Api) WithLogger(logger log.FieldLogger) *Api {
 	return &api
 }
 
-func (a *Api) request(path string, query map[string]interface{}) (map[string]interface{}, error) {
-	a.Logger.Debugln("HTTP GET", a.BaseUrl+path)
-	callback := fmt.Sprintf("jQuery%s_%d", tool.RandMath(rand.NewSource(time.Now().UnixNano())).WithLetters("123456789").Text(21), time.Now().UnixMilli())
-	if query == nil {
-		query = make(map[string]interface{}, 2)
+// request 不记录表单、响应正文或会话令牌。
+func (a *Api) request(method, path string, values url.Values, result any) error {
+	addr := a.BaseUrl + path
+	var body io.Reader
+	if method == http.MethodGet {
+		if len(values) > 0 {
+			addr += "?" + values.Encode()
+		}
+	} else {
+		body = strings.NewReader(values.Encode())
 	}
-	query["callback"] = callback
-	query["_"] = fmt.Sprint(time.Now().UnixMilli())
-	httpTool := tool.NewHttpTool(a.Client)
-	req, err := httpTool.GenReq("GET", &tool.DoHttpReq{
-		Url:    a.BaseUrl + path,
-		Query:  query,
-		Header: a.CustomHeader,
-	})
+	req, err := http.NewRequest(method, addr, body)
 	if err != nil {
-		a.Logger.Debugln(err)
-		return nil, err
+		return err
 	}
-
-	resp, err := httpTool.Client.Do(req)
+	for k, v := range a.CustomHeader {
+		req.Header.Set(k, fmt.Sprint(v))
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	if method == http.MethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
+	if a.csrfToken != "" {
+		req.Header.Set("X-CSRF-Token", a.csrfToken)
+	}
+	a.Logger.Debugln("HTTP", method, a.BaseUrl+path)
+	resp, err := a.Client.Do(req)
 	if err != nil {
-		a.Logger.Debugln(err)
-		return nil, err
+		return err
 	}
 	defer resp.Body.Close()
-
-	data, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusForbidden {
+			a.csrfToken = ""
+		}
+		return fmt.Errorf("%s: HTTP %d", path, resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		a.Logger.Debugln(err)
+		return err
+	}
+	if err = json.Unmarshal(data, result); err != nil {
+		return fmt.Errorf(
+			"%s: JSON decode failed (HTTP %d, Content-Type=%q, bytes=%d): %w",
+			path, resp.StatusCode, resp.Header.Get("Content-Type"), len(data), err,
+		)
+	}
+	return nil
+}
+
+func (a *Api) ensureCSRF() error {
+	if a.csrfToken != "" {
+		return nil
+	}
+	var result struct {
+		Token string `json:"csrf_token"`
+	}
+	if err := a.request(http.MethodGet, "api/csrf-token", nil, &result); err != nil {
+		return err
+	}
+	if result.Token == "" {
+		return fmt.Errorf("csrf-token: %w", ErrResultCannotFound)
+	}
+	a.csrfToken = result.Token
+	return nil
+}
+
+func (a *Api) accountRequest(method, action string, values url.Values) (*accountResponse, error) {
+	if err := a.ensureCSRF(); err != nil {
 		return nil, err
 	}
-	res := string(data)
-
-	a.Logger.Debugln(res)
-	res = strings.TrimPrefix(res, callback+"(")
-	res = strings.TrimSuffix(res, ")")
-
-	var r map[string]interface{}
-	return r, json.Unmarshal([]byte(res), &r)
+	var result accountResponse
+	if err := a.request(method, "api/account/"+action, values, &result); err != nil {
+		return nil, err
+	}
+	if result.Code == nil {
+		return nil, fmt.Errorf("account/%s: %w", action, ErrResultCannotFound)
+	}
+	return &result, nil
 }
 
-func (a *Api) GetUserInfo() (map[string]interface{}, error) {
-	return a.request("cgi-bin/rad_user_info", nil)
+func (a *Api) GetUserInfo(params url.Values) (*accountResponse, error) {
+	return a.accountRequest(http.MethodGet, "status", params)
 }
 
-type LoginRequest struct {
-	Username    string
-	Password    string
-	AcID        string
-	IP          string
-	Info        string
-	ChkSum      string
-	N           string
-	Type        string
-	OS          string
-	Name        string
-	DoubleStack string
+func (a *Api) Check(form url.Values) (*accountResponse, error) {
+	return a.accountRequest(http.MethodPost, "check", form)
 }
 
-func (a *Api) Login(req *LoginRequest) (map[string]interface{}, error) {
-	return a.request(
-		"cgi-bin/srun_portal",
-		map[string]interface{}{
-			"action":       "login",
-			"username":     req.Username,
-			"password":     req.Password,
-			"ac_id":        req.AcID,
-			"ip":           req.IP,
-			"info":         req.Info,
-			"chksum":       req.ChkSum,
-			"n":            req.N,
-			"type":         req.Type,
-			"os":           req.OS,
-			"name":         req.Name,
-			"double_stack": req.DoubleStack,
-		})
-}
-
-func (a *Api) GetChallenge(username, ip string) (map[string]interface{}, error) {
-	return a.request(
-		"cgi-bin/get_challenge",
-		map[string]interface{}{
-			"username": username,
-			"ip":       ip,
-		})
+func (a *Api) Login(form url.Values) (*accountResponse, error) {
+	return a.accountRequest(http.MethodPost, "login", form)
 }

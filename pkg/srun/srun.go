@@ -1,165 +1,152 @@
 package srun
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 )
 
 type Conf struct {
-	//调用 API 时直接访问 https URL
-	Https bool
-	//登录参数，不可缺省
+	Https        bool
 	LoginInfo    LoginInfo
 	Client       *http.Client
 	CustomHeader map[string]interface{}
-
-	Logger log.FieldLogger
+	Logger       log.FieldLogger
 }
 
 func New(conf *Conf) *Srun {
-	if conf.Logger == nil {
-		conf.Logger = log.New()
+	logger := conf.Logger
+	if logger == nil {
+		logger = log.New()
 	}
-
-	srun := &Srun{
-		LoginInfo: conf.LoginInfo,
-		Logger:    conf.Logger,
-	}
-	srun.Api.Init(&ApiConfig{
-		Https:        conf.Https,
-		Domain:       conf.LoginInfo.Form.Domain,
-		Client:       conf.Client,
-		CustomHeader: conf.CustomHeader,
-		Logger:       conf.Logger,
+	client := &Srun{LoginInfo: conf.LoginInfo, Logger: logger}
+	client.Api.Init(&ApiConfig{
+		Https: conf.Https, Domain: conf.LoginInfo.Form.Domain,
+		Client: conf.Client, CustomHeader: conf.CustomHeader, Logger: logger,
 	})
-	return srun
+	return client
 }
 
 type Srun struct {
-	//登录参数，不可缺省
 	LoginInfo LoginInfo
 	Api       Api
 	Logger    log.FieldLogger
 }
 
-// LoginStatus err will not be nil only when both online and ip is found.
-func (c Srun) LoginStatus() (online *bool, ip *string, err error) {
-	res, err := c.Api.GetUserInfo()
+func (c *Srun) networkParams() (url.Values, error) {
+	if _, err := c.Api.NewDetector().DetectIp(); err != nil {
+		return nil, err
+	}
+	params := make(url.Values)
+	for key, values := range c.Api.params {
+		params[key] = append([]string(nil), values...)
+	}
+	if c.LoginInfo.Meta.Acid != "" {
+		params.Set("nasId", c.LoginInfo.Meta.Acid)
+	}
+	if nasID, err := strconv.Atoi(params.Get("nasId")); err != nil || nasID <= 0 {
+		return nil, errors.New("缺少有效的 nasId，请配置 meta.acid 或使用 --auto-acid")
+	}
+	if mac := params.Get("mac"); mac != "" {
+		params.Set("userMac", mac)
+		params.Del("mac")
+	}
+	return params, nil
+}
+
+// LoginStatus 返回认证状态和客户端 IPv4；无法确认状态时返回错误。
+func (c *Srun) LoginStatus() (online *bool, ip *string, err error) {
+	params, err := c.networkParams()
 	if err != nil {
 		return nil, nil, err
 	}
-
-	errRes, ok := res["error"]
-	if ok {
-		isOnlineStr, ok := errRes.(string)
-		if ok {
-			isOnline := isOnlineStr == "ok"
-			online = &isOnline
+	res, err := c.Api.GetUserInfo(params)
+	if err != nil {
+		return nil, nil, err
+	}
+	clientIP := params.Get("userIpv4")
+	var isOnline bool
+	switch *res.Code {
+	case 0:
+		if res.Online == nil {
+			return nil, nil, ErrResultCannotFound
 		}
-	}
-
-	ipInterface, ok := res["client_ip"]
-	if !ok {
-		ipInterface, ok = res["online_ip"]
-	}
-	if ipInterface != nil {
-		ipStr, ok := ipInterface.(string)
-		if ok {
-			ip = &ipStr
+		isOnline = true
+		if res.Online.UserIpv4 != "" {
+			parsed := net.ParseIP(res.Online.UserIpv4)
+			if parsed == nil || parsed.To4() == nil {
+				return nil, nil, errors.New("在线状态返回了无效的客户端 IPv4")
+			}
+			clientIP = parsed.String()
 		}
+	case 1:
+		isOnline = false
+	default:
+		return nil, nil, fmt.Errorf("查询登录状态失败: code=%d", *res.Code)
 	}
-
-	if online == nil || ip == nil {
-		err = ErrResultCannotFound
-	}
-	return
+	return &isOnline, &clientIP, nil
 }
 
-func (c Srun) DoLogin(clientIP string) error {
-	c.Logger.Debugln("正在获取 Token")
-
-	if c.LoginInfo.Form.UserType != "" {
-		c.LoginInfo.Form.Username += "@" + c.LoginInfo.Form.UserType
+func (c *Srun) responseError(res *accountResponse) error {
+	kind := ErrAuthentication
+	if *res.Code == 2 {
+		kind = ErrCaptchaRequired
+	} else if *res.Code == 0 && res.IsChangePwd == 1 {
+		kind = ErrPasswordChange
 	}
+	message := res.Msg
+	for _, secret := range []string{c.LoginInfo.Form.Password, c.Api.csrfToken} {
+		if secret != "" {
+			message = strings.ReplaceAll(message, secret, "[redacted]")
+		}
+	}
+	return fmt.Errorf("%w: code=%d %s", kind, *res.Code, message)
+}
 
-	res, err := c.Api.GetChallenge(c.LoginInfo.Form.Username, clientIP)
+func (c *Srun) DoLogin(clientIP string) error {
+	if c.LoginInfo.Form.Username == "" || c.LoginInfo.Form.Password == "" {
+		return fmt.Errorf("%w: 账号或密码为空", ErrAuthentication)
+	}
+	form, err := c.networkParams()
 	if err != nil {
 		return err
 	}
-	token, ok := res["challenge"]
-	if !ok {
-		return ErrResultCannotFound
+	if clientIP != "" && clientIP != form.Get("userIpv4") {
+		return errors.New("客户端 IP 与认证入口不一致，请重新检测")
 	}
-	tokenStr := token.(string)
-	c.Logger.Debugln("token: ", tokenStr)
+	form.Set("username", c.LoginInfo.Form.Username)
+	form.Set("password", c.LoginInfo.Form.Password)
+	form.Set("isp", c.LoginInfo.Form.UserType)
+
+	c.Logger.Debugln("检查账号")
+	res, err := c.Api.Check(form)
+	if err != nil {
+		return err
+	}
+	if *res.Code != 0 || res.IsChangePwd == 1 {
+		return c.responseError(res)
+	}
 
 	c.Logger.Debugln("发送登录请求")
-
-	info, err := json.Marshal(map[string]string{
-		"username": c.LoginInfo.Form.Username,
-		"password": c.LoginInfo.Form.Password,
-		"ip":       clientIP,
-		"acid":     c.LoginInfo.Meta.Acid,
-		"enc_ver":  c.LoginInfo.Meta.Enc,
-	})
+	res, err = c.Api.Login(form)
 	if err != nil {
 		return err
 	}
-
-	var infoPrefix string
-	if c.LoginInfo.Meta.InfoPrefix != "" {
-		infoPrefix = fmt.Sprintf("{%s}", c.LoginInfo.Meta.InfoPrefix)
+	if *res.Code != 0 {
+		return c.responseError(res)
 	}
-	EncryptedInfo := infoPrefix + Base64(XEncode(string(info), tokenStr))
-	Md5Str, err := Md5(tokenStr, c.LoginInfo.Form.Password)
+	online, _, err := c.LoginStatus()
 	if err != nil {
 		return err
 	}
-	EncryptedMd5 := "{MD5}" + Md5Str
-	EncryptedChkstr := Sha1(
-		tokenStr + c.LoginInfo.Form.Username + tokenStr + Md5Str +
-			tokenStr + c.LoginInfo.Meta.Acid + tokenStr + clientIP +
-			tokenStr + c.LoginInfo.Meta.N + tokenStr + c.LoginInfo.Meta.Type +
-			tokenStr + EncryptedInfo,
-	)
-
-	var doubleStack string
-	if c.LoginInfo.Meta.DoubleStack {
-		doubleStack = "1"
-	} else {
-		doubleStack = "0"
+	if !*online {
+		return errors.New("登录请求已返回，但服务器尚未确认在线")
 	}
-
-	res, err = c.Api.Login(&LoginRequest{
-		Username:    c.LoginInfo.Form.Username,
-		Password:    EncryptedMd5,
-		AcID:        c.LoginInfo.Meta.Acid,
-		IP:          clientIP,
-		Info:        EncryptedInfo,
-		ChkSum:      EncryptedChkstr,
-		N:           c.LoginInfo.Meta.N,
-		Type:        c.LoginInfo.Meta.Type,
-		OS:          c.LoginInfo.Meta.OS,
-		Name:        c.LoginInfo.Meta.Name,
-		DoubleStack: doubleStack,
-	})
-	if err != nil {
-		return err
-	}
-	var result interface{}
-	result, ok = res["error"]
-	if !ok {
-		return ErrResultCannotFound
-	}
-	LoginResult := result.(string)
-
-	if LoginResult != "ok" {
-		return errors.New(LoginResult)
-	}
-
 	return nil
 }

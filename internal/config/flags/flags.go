@@ -20,9 +20,9 @@ func init() {
 
 	flag.StringVar(&Interface, "interface", "", "specify the eth name")
 	flag.BoolVar(&Debug, "debug", false, "enable debug mode")
-	flag.BoolVar(&AutoAcid, "auto-acid", false, "auto detect acid")
-	flag.StringVar(&Acid, "acid", "", "specify acid value")
-	flag.BoolVar(&AutoEnc, "auto-enc", false, "auto detect enc")
+	flag.BoolVar(&AutoAcid, "auto-acid", false, "auto detect CUG nasId")
+	flag.StringVar(&Acid, "acid", "", "specify CUG nasId")
+	flag.BoolVar(&AutoEnc, "auto-enc", false, "accepted for compatibility; unused by CUG")
 
 	flag.Parse()
 }

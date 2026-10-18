@@ -4,6 +4,8 @@
 [![Release](https://img.shields.io/github/v/release/Mmx233/BitSrunLoginGo?color=blueviolet&include_prereleases)](https://github.com/Mmx233/BitSrunLoginGo/releases)
 [![Dockerhub](https://img.shields.io/docker/pulls/mmx233/bitsrunlogin-go)](https://hub.docker.com/repository/docker/mmx233/bitsrunlogin-go)
 
+fork from [Mmx233](https://github.com/Mmx233/BitSrunLoginGo)，由于CUG的新版认证界面的页面地址发生更改，本项目提供适配版本。
+
 深澜校园网登录脚本 Go 语言版。GO 语言可以直接交叉编译出 mips 架构可执行程序（路由器）（主流平台更不用说了），从而免除安装环境。
 
 > 主要登录逻辑来自： https://github.com/coffeehat/BIT-srun-login-script
@@ -30,10 +32,22 @@
 ```text
 --interface eth0.1  #指定使用 eth0.1 登录，多网卡模式无效
 --debug             #临时开启 debug 模式
---auto-acid         #自动嗅探 acid
---acid 7            #覆写配置文件 acid 值
---auto-enc          #自动嗅探 enc
+--auto-acid         #从认证入口自动获取 nasId，覆盖 meta.acid
+--acid 7            #手动指定 nasId，写入 meta.acid
+--auto-enc          #保留参数兼容性，CUG 认证不使用
 ```
+
+Config.yaml 结构和默认值沿用原模板。连接 CUG 时，请将 `form.domain` 改为 `192.168.167.72`，填写账号密码，清空 `form.user_type`，并将 `settings.basic.https` 设为 `true`。`meta.acid` 对应新接口的 `nasId`：本次接入探测到的值为 `7`，也可使用 `--auto-acid` 自动获取。
+
+程序从 `/api/r/default` 的跳转 URL 提取客户端 IPv4，再通过 `/api/csrf-token` 和 `/api/account/*` 完成认证。账号原样提交；`user_type` 作为独立的 `isp` 字段，当前 CUG 账号登录页使用空值。
+
+```shell
+./bitsrun --config=./Config.yaml --auto-acid
+```
+
+原有 `meta.n`、`type`、`enc`、`os`、`name`、`info_prefix`、`double_stack` 和 `settings.reality` 保留在配置中，CUG 流程不使用这些字段。认证始终携带探测到的 IPv4。
+
+如果环境设置了 HTTP/HTTPS 代理，请将 `192.168.167.72` 加入 `NO_PROXY`。`skip_cert_verify` 仍按现有配置生效，仅在确认需要跳过服务器证书校验时开启。
 
 Config.yaml 说明：
 
@@ -43,10 +57,10 @@ form:
   username: "" #账号
   user_type: cmcc #运营商类型，详情看下方文字说明
   password: "" #密码
-meta: #登录参数
+meta: #CUG 使用 acid，其余字段保留兼容配置
   "n": "200"
   type: "1"
-  acid: "5"
+  acid: "7"
   enc: srun_bx1 # enc 不在表单中，但一般都是默认值。你可以使用 --auto-enc 或在 js 中搜索 enc 来找到真实值
   os: Windows 10
   name: windows
@@ -201,27 +215,23 @@ go build -trimpath -ldflags "-s -w -extldflags '-static -fpic' -H windowsgui" ./
 package main
 
 import (
-	"github.com/Mmx233/BitSrunLoginGo/pkg/srun"
+    "net/http"
+    "time"
+
+    "github.com/Mmx233/BitSrunLoginGo/pkg/srun"
 )
 
 func main() {
-    //具体用法请查看 struct 注释
     client := srun.New(&srun.Conf{
-        Https:  false,
-        Client: nil,
+        Https: true,
+        Client: &http.Client{Timeout: 10 * time.Second},
         LoginInfo: srun.LoginInfo{
-            Form: &srun.LoginForm{
-                Domain:   "",
-                Username: "",
-                UserType: "",
-                Password: "",
+            Form: srun.LoginForm{
+                Domain: "192.168.167.72",
+                Username: "你的账号",
+                Password: "你的密码",
             },
-            Meta: &srun.LoginMeta{
-                N:    "",
-                Type: "",
-                Acid: "",
-                Enc:  "",
-            },
+            Meta: srun.LoginMeta{Acid: "7"},
         },
     })
 
@@ -229,12 +239,10 @@ func main() {
     if err != nil {
         panic(err)
     }
-	
-    if !online {
-        err = client.DoLogin(ip)
-        if err != nil {
+    if !*online {
+        if err := client.DoLogin(*ip); err != nil {
             panic(err)
-        }	
+        }
     }
 }
 ```

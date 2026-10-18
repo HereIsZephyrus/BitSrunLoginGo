@@ -22,6 +22,15 @@ import (
 var ipLast string
 var debugTip sync.Once
 
+// 守护模式继续查询在线状态，但不重复提交已被服务器拒绝的凭据。
+var loginBlocks sync.Map
+
+type loginKey struct {
+	Form      srun.LoginForm
+	Acid      string
+	Interface string
+}
+
 type Conf struct {
 	Logger                      log.FieldLogger
 	IsOnlineDetectLogDebugLevel bool
@@ -138,9 +147,19 @@ type SingleConf struct {
 
 func Single(conf SingleConf) error {
 	if config.Settings.Backoff.Enable {
-		return backoff.NewInstance(func(ctx context.Context) error {
-			return doLogin(conf)
+		var terminalErr error
+		err := backoff.NewInstance(func(ctx context.Context) error {
+			err := doLogin(conf)
+			if srun.IsUserActionRequired(err) {
+				terminalErr = err
+				return nil // 结束退避后向调用方返回真实的认证错误。
+			}
+			return err
 		}, config.BackoffConfig).Run(context.TODO())
+		if terminalErr != nil {
+			return terminalErr
+		}
+		return err
 	}
 	return doLogin(conf)
 }
@@ -167,52 +186,13 @@ func doLogin(conf SingleConf) error {
 
 	srunDetector := srunClient.Api.NewDetector()
 
-	// Reality 与 Acid
-	var acidOnReality bool
-	if config.Settings.Reality.Enable {
-		logger := logger.WithField(keys.LogLoginModule, "reality")
-
-		logger.Debugln("开始 Reality 流程")
-		acid, _, err := srunDetector.WithLogger(logger).Reality(config.Settings.Reality.Addr, flags.AutoAcid)
+	if flags.AutoAcid {
+		acid, err := srunDetector.WithLogger(logger.WithField(keys.LogLoginModule, "acid")).DetectAcid()
 		if err != nil {
-			logger.Warnln("Reality 请求异常:", err)
-		} else if flags.AutoAcid && acid != "" {
-			acidOnReality = true
-			logger.Debugf("使用嗅探 acid: %s", acid)
-			srunClient.LoginInfo.Meta.Acid = acid
-		}
-	}
-	if !acidOnReality && flags.AutoAcid {
-		logger := logger.WithField(keys.LogLoginModule, "acid")
-
-		logger.Debugln("开始嗅探")
-		acid, err := srunDetector.WithLogger(logger).DetectAcid()
-		if err != nil {
-			if errors.Is(err, srun.ErrAcidCannotFound) {
-				logger.Warnln("找不到 acid，使用配置 acid")
-			} else {
-				logger.Warnf("嗅探失败，使用配置 acid: %v", err)
-			}
+			logger.Warnf("获取 nasId 失败，使用配置 meta.acid: %v", err)
 		} else {
-			logger.Debugf("使用嗅探 acid: %s", acid)
+			logger.Debugf("使用探测 nasId: %s", acid)
 			srunClient.LoginInfo.Meta.Acid = acid
-		}
-	}
-
-	if flags.AutoEnc {
-		logger := logger.WithField(keys.LogLoginModule, "enc")
-
-		logger.Debugln("开始嗅探")
-		enc, err := srunDetector.WithLogger(logger).DetectEnc()
-		if err != nil {
-			if errors.Is(err, srun.ErrEnvCannotFound) {
-				logger.Warnln("找不到 enc，使用配置 enc")
-			} else {
-				logger.Warnf("嗅探失败，使用配置 enc: %v", err)
-			}
-		} else {
-			logger.Debugf("使用嗅探 enc: %s", enc)
-			srunClient.LoginInfo.Meta.Enc = enc
 		}
 	}
 
@@ -226,34 +206,21 @@ func doLogin(conf SingleConf) error {
 
 	_Println("正在获取登录状态")
 
-	var clientIp, loginIp string
-
-	isClientIpRequired := !conf.Meta.DoubleStack || config.Settings.DDNS.Enable
 	online, ip, err := srunClient.LoginStatus()
 	if err != nil {
-		if online == nil {
-			return err
-		} else if isClientIpRequired {
-			logger.Debugln("响应体缺失客户端 ip，尝试从页面匹配")
-			clientIp, err = srunDetector.DetectIp()
-			if err != nil {
-				return err
-			}
-		}
-	} else if ip != nil {
-		clientIp = *ip
+		return err
 	}
-
-	if conf.Meta.DoubleStack {
-		logger.Debugln("使用双栈网络时认证 ip 为空")
-	} else {
-		loginIp = clientIp
-		logger.Debugln("认证客户端 ip: ", loginIp)
+	clientIp := *ip
+	logger.Debugln("认证客户端 ip: ", clientIp)
+	key := loginKey{Form: *conf.Form, Acid: srunClient.LoginInfo.Meta.Acid}
+	if conf.Eth != nil {
+		key.Interface = conf.Eth.Name
 	}
 
 	// 登录执行
 
 	if *online {
+		loginBlocks.Delete(key)
 		_Println("已登录~")
 
 		if config.Settings.DDNS.Enable && config.Settings.Guardian.Enable && ipLast != clientIp {
@@ -265,9 +232,15 @@ func doLogin(conf SingleConf) error {
 		return nil
 	}
 
+	if blocked, ok := loginBlocks.Load(key); ok {
+		return blocked.(error)
+	}
 	logger.Infoln("检测到用户未登录，开始尝试登录...")
 
-	if err = srunClient.DoLogin(loginIp); err != nil {
+	if err = srunClient.DoLogin(clientIp); err != nil {
+		if srun.IsUserActionRequired(err) {
+			loginBlocks.Store(key, err)
+		}
 		return err
 	}
 
